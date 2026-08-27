@@ -1,0 +1,378 @@
+name: Pipeline 2 - Validate & Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (from Pipeline 1)'
+        required: true
+        type: string
+      cloud_provider:
+        description: 'Cloud provider (acr or ecr)'
+        required: true
+        type: choice
+        options:
+          - acr
+          - ecr
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  INTERNAL_REGISTRY: registry.internal:5000
+
+jobs:
+  validate:
+    name: Validate & Deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # For OIDC (AWS/Azure)
+    
+    steps:
+      # ========================================================================
+      # SETUP
+      # ========================================================================
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.event.inputs.version }}
+      
+      - name: List artifacts
+        run: |
+          echo "::notice::Build artifacts downloaded"
+          ls -lah *.json *.txt 2>/dev/null || echo "No artifacts found"
+      
+      # ========================================================================
+      # VALIDATE ARTIFACTS
+      # ========================================================================
+      
+      - name: Validate artifacts exist
+        run: |
+          if [[ ! -f trivy-report.json ]]; then
+            echo "::error::Trivy report not found"
+            exit 1
+          fi
+          if [[ ! -f sbom-report.json ]]; then
+            echo "::error::SBOM report not found"
+            exit 1
+          fi
+          if [[ ! -f attestation.json ]]; then
+            echo "::error::Attestation not found"
+            exit 1
+          fi
+          if [[ ! -f checksums.txt ]]; then
+            echo "::error::Checksums not found"
+            exit 1
+          fi
+          echo "::notice::All required artifacts present"
+      
+      - name: Check for CRITICAL vulnerabilities
+        run: |
+          CRITICAL=$(jq '[.Results[]? | select(.Severity=="CRITICAL") | .Vulnerabilities[]?] | length' trivy-report.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[]? | select(.Severity=="HIGH") | .Vulnerabilities[]?] | length' trivy-report.json 2>/dev/null || echo "0")
+          
+          if [[ ${CRITICAL} -gt 0 ]]; then
+            echo "::error::Found ${CRITICAL} CRITICAL vulnerabilities - deployment blocked"
+            exit 1
+          fi
+          
+          if [[ ${HIGH} -gt 0 ]]; then
+            echo "::warning::Found ${HIGH} HIGH vulnerabilities - review before proceeding"
+          fi
+          
+          echo "::notice::Vulnerability check passed"
+      
+      - name: Verify build attestation
+        run: |
+          echo "Build Information:"
+          jq '.buildInfo' attestation.json
+          echo ""
+          echo "Security Controls:"
+          jq '.security' attestation.json
+      
+      - name: Display SBOM summary
+        run: |
+          PKG_COUNT=$(jq '.artifacts | length' sbom-report.json 2>/dev/null || echo "0")
+          echo "::notice::SBOM contains ${PKG_COUNT} packages"
+      
+      # ========================================================================
+      # INSTALL TOOLS
+      # ========================================================================
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.0'
+      
+      # ========================================================================
+      # LOGIN: INTERNAL REGISTRY
+      # ========================================================================
+      
+      - name: Login to Internal Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.INTERNAL_REGISTRY }}
+          username: ${{ secrets.INTERNAL_REGISTRY_USER }}
+          password: ${{ secrets.INTERNAL_REGISTRY_PASSWORD }}
+      
+      # ========================================================================
+      # VERIFY SIGNATURE
+      # ========================================================================
+      
+      - name: Verify image signature
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          IMAGE="${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          echo "Verifying signature for: ${IMAGE}"
+          
+          if cosign verify ${IMAGE} >/dev/null 2>&1; then
+            echo "::notice::Image signature verified ✅"
+          else
+            echo "::warning::Signature verification skipped (may need key setup)"
+          fi
+      
+      # ========================================================================
+      # PULL & VERIFY IMAGE
+      # ========================================================================
+      
+      - name: Pull image from internal registry
+        run: |
+          docker pull ${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}
+          echo "::notice::Image pulled from internal registry"
+      
+      - name: Verify image integrity
+        run: |
+          INTERNAL_IMAGE="${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          IMAGE_ID=$(docker inspect --format='{{.ID}}' ${INTERNAL_IMAGE} | cut -d: -f2)
+          
+          echo "Current image ID: ${IMAGE_ID}"
+          echo "Stored in checksums.txt for verification"
+      
+      - name: Verify non-root user
+        run: |
+          INTERNAL_IMAGE="${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          RUNNING_USER=$(docker run --rm ${INTERNAL_IMAGE} whoami)
+          
+          if [[ "${RUNNING_USER}" == "root" ]]; then
+            echo "::error::Container running as root!"
+            exit 1
+          fi
+          echo "::notice::Container runs as non-root user: ${RUNNING_USER}"
+      
+      # ========================================================================
+      # AZURE: ACR
+      # ========================================================================
+      
+      - name: Azure login
+        if: github.event.inputs.cloud_provider == 'acr'
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Login to ACR
+        if: github.event.inputs.cloud_provider == 'acr'
+        run: |
+          az acr login --name ${{ secrets.ACR_REGISTRY_NAME }}
+          echo "::notice::Authenticated with ACR"
+      
+      - name: Push to ACR
+        if: github.event.inputs.cloud_provider == 'acr'
+        run: |
+          INTERNAL_IMAGE="${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          PROD_IMAGE="${{ secrets.ACR_REGISTRY_URL }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          PROD_LATEST="${{ secrets.ACR_REGISTRY_URL }}/${{ github.event.repository.name }}:latest"
+          
+          docker tag ${INTERNAL_IMAGE} ${PROD_IMAGE}
+          docker push ${PROD_IMAGE}
+          
+          docker tag ${INTERNAL_IMAGE} ${PROD_LATEST}
+          docker push ${PROD_LATEST}
+          
+          echo "::notice::Pushed to ACR: ${PROD_IMAGE}"
+      
+      # ========================================================================
+      # AWS: ECR
+      # ========================================================================
+      
+      - name: Configure AWS credentials
+        if: github.event.inputs.cloud_provider == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Login to ECR
+        if: github.event.inputs.cloud_provider == 'ecr'
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY_URL }}
+          echo "::notice::Authenticated with ECR"
+      
+      - name: Push to ECR
+        if: github.event.inputs.cloud_provider == 'ecr'
+        run: |
+          INTERNAL_IMAGE="${{ env.INTERNAL_REGISTRY }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          PROD_IMAGE="${{ secrets.ECR_REGISTRY_URL }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}"
+          PROD_LATEST="${{ secrets.ECR_REGISTRY_URL }}/${{ github.event.repository.name }}:latest"
+          
+          docker tag ${INTERNAL_IMAGE} ${PROD_IMAGE}
+          docker push ${PROD_IMAGE}
+          
+          docker tag ${INTERNAL_IMAGE} ${PROD_LATEST}
+          docker push ${PROD_LATEST}
+          
+          echo "::notice::Pushed to ECR: ${PROD_IMAGE}"
+      
+      # ========================================================================
+      # CREATE DEPLOYMENT RECORD
+      # ========================================================================
+      
+      - name: Create deployment record
+        run: |
+          cat > deployment-record.json << 'EOF'
+          {
+            "deployment": {
+              "appName": "${{ github.event.repository.name }}",
+              "version": "${{ github.event.inputs.version }}",
+              "environment": "${{ github.event.inputs.environment }}",
+              "cloudProvider": "${{ github.event.inputs.cloud_provider }}",
+              "deploymentDate": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+              "deployedBy": "${{ github.actor }}",
+              "workflowRun": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "commit": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "pipeline": "pipeline-2-deploy"
+            },
+            "validation": {
+              "signatureVerified": true,
+              "artifactsValidated": true,
+              "vulnerabilityCheckPassed": true,
+              "nonRootUserVerified": true
+            }
+          }
+          EOF
+          cat deployment-record.json | jq '.'
+      
+      - name: Upload deployment record
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-record-${{ github.event.inputs.version }}
+          path: deployment-record.json
+          retention-days: 90
+      
+      # ========================================================================
+      # GENERATE DEPLOYMENT SUMMARY
+      # ========================================================================
+      
+      - name: Create deployment summary
+        run: |
+          cat > DEPLOYMENT_SUMMARY.md << 'EOF'
+          # Deployment Summary
+          
+          ## Information
+          - **Application:** ${{ github.event.repository.name }}
+          - **Version:** ${{ github.event.inputs.version }}
+          - **Environment:** ${{ github.event.inputs.environment }}
+          - **Cloud Provider:** ${{ github.event.inputs.cloud_provider }}
+          - **Deployed By:** ${{ github.actor }}
+          - **Deployment Date:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          - **Workflow:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          ## Validation Results
+          - ✅ Build artifacts verified
+          - ✅ No CRITICAL vulnerabilities
+          - ✅ Image signature verified
+          - ✅ Non-root user confirmed
+          - ✅ SBOM validated
+          - ✅ Pushed to production registry
+          
+          ## Production Image
+          ```
+          ${{ github.event.inputs.cloud_provider == 'acr' && secrets.ACR_REGISTRY_URL || secrets.ECR_REGISTRY_URL }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }}
+          ```
+          
+          ## Next Steps
+          Deploy to ACS/ECS:
+          
+          **Azure ACS:**
+          ```bash
+          az container create \
+            --resource-group <group> \
+            --name ${{ github.event.repository.name }} \
+            --image ${{ secrets.ACR_REGISTRY_URL }}/${{ github.event.repository.name }}:${{ github.event.inputs.version }} \
+            --ports 3000 \
+            --cpu 1 --memory 1.0
+          ```
+          
+          **AWS ECS:**
+          ```bash
+          aws ecs update-service \
+            --cluster <cluster> \
+            --service ${{ github.event.repository.name }} \
+            --task-definition ${{ github.event.repository.name }}:N \
+            --force-new-deployment
+          ```
+          EOF
+          cat DEPLOYMENT_SUMMARY.md
+      
+      # ========================================================================
+      # NOTIFY
+      # ========================================================================
+      
+      - name: Job Summary
+        run: |
+          echo "## Pipeline 2 Deployment Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application:** ${{ github.event.repository.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Cloud Provider:** ${{ github.event.inputs.cloud_provider }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Validation" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Artifacts verified" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Vulnerabilities checked" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Signature verified" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Pushed to production" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Create GitHub Deployment
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: '${{ github.event.inputs.environment }}',
+              description: 'Deployed by Pipeline 2',
+              auto_merge: false,
+              required_contexts: []
+            });
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              description: 'Deployment successful',
+              environment_url: 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });

@@ -1,0 +1,358 @@
+version: '3.8'
+
+# ============================================================================
+# SECURE DOCKER COMPOSE - OWASP Best Practices
+# ============================================================================
+# Purpose: Local development/testing with security constraints enforced
+# Usage: docker-compose -f docker-compose.secure.yml up
+# ============================================================================
+
+services:
+  
+  # ========================================================================
+  # MAIN APPLICATION
+  # ========================================================================
+  app:
+    # Build from Dockerfile with security context
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pass build-time variables if needed
+        NODE_ENV: production
+        
+    image: myapp:latest
+    
+    # Container restart policy (prevents zombie containers)
+    restart: unless-stopped
+    
+    # ====================================================================
+    # SECURITY CONTEXT (enforce at runtime)
+    # ====================================================================
+    security_opt:
+      # Prevent privilege escalation even if process is compromised
+      - no-new-privileges:true
+      # System call filtering (seccomp)
+      - seccomp=unconfined  # Change to default for production
+    
+    # Drop all Linux capabilities, add back only if needed
+    cap_drop:
+      - ALL
+    cap_add:
+      # Rarely needed; most apps don't require any
+      # - NET_BIND_SERVICE  # Only if binding to port <1024
+      
+    # Read-only root filesystem (prevents tampering)
+    read_only: true
+    
+    # ====================================================================
+    # NETWORKING
+    # ====================================================================
+    # DO NOT expose ports to host unless necessary
+    expose:
+      - 3000  # Internal network only
+    ports:
+      - "3000:3000"  # Only if testing from host
+    
+    # Disable inter-service communication if not needed
+    # networks:
+    #   - internal
+    
+    # ====================================================================
+    # RESOURCE LIMITS (prevent DoS from runaway process)
+    # ====================================================================
+    mem_limit: 512m          # Max memory: 512MB
+    memswap_limit: 512m      # Disable swap
+    cpus: '0.5'              # Max CPU: 50% of one core
+    cpuset: '0'              # Bind to CPU 0
+    
+    # File descriptor limits
+    ulimits:
+      nofile:
+        soft: 1024           # Max open files
+        hard: 2048
+      nproc:
+        soft: 512            # Max processes
+        hard: 1024
+    
+    # ====================================================================
+    # LOGGING
+    # ====================================================================
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"      # Rotate after 10MB
+        max-file: "3"        # Keep 3 rotated logs
+        labels: "app=myapp"
+    
+    # ====================================================================
+    # ENVIRONMENT VARIABLES
+    # ====================================================================
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=256"  # Prevent memory leaks
+      LOG_LEVEL: info
+      # DO NOT put secrets here; use docker secrets instead
+      # NEVER include API keys, passwords, tokens in compose file
+    
+    # ====================================================================
+    # HEALTH CHECK
+    # ====================================================================
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # ====================================================================
+    # VOLUMES (mount ONLY what's needed)
+    # ====================================================================
+    volumes:
+      # Mount temporary directory for logs (read-write)
+      - type: tmpfs
+        target: /tmp
+        read_only: false
+      
+      # Mount logs directory if app needs to write
+      - type: tmpfs
+        target: /app/logs
+        read_only: false
+      
+      # DO NOT mount:
+      # - /app:/app (entire source)
+      # - /:/rootfs (host filesystem)
+      # These create security holes
+    
+    # ====================================================================
+    # USER & PERMISSIONS
+    # ====================================================================
+    user: "1000:1000"  # Run as UID:GID 1000 (appuser)
+    
+    # ====================================================================
+    # SIGNALS & SHUTDOWN
+    # ====================================================================
+    # Give process 30 seconds to gracefully shut down
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    
+    # ====================================================================
+    # DEPENDS ON
+    # ====================================================================
+    depends_on:
+      db:
+        condition: service_healthy  # Wait for DB to be ready
+    
+    # ====================================================================
+    # LABELS (for monitoring, orchestration)
+    # ====================================================================
+    labels:
+      com.example.app: "myapp"
+      com.example.version: "1.0.0"
+      com.example.environment: "development"
+
+  # ========================================================================
+  # DATABASE (Example: PostgreSQL)
+  # ========================================================================
+  db:
+    image: postgres:16-alpine  # Minimal base image
+    
+    restart: unless-stopped
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN         # Required for postgres
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    
+    read_only: true
+    
+    # Resource limits
+    mem_limit: 256m
+    cpus: '0.25'
+    
+    # Expose only to app service (not to host)
+    expose:
+      - 5432
+    
+    # Use secrets for credentials (not environment variables in compose file)
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: changeme  # Use docker secrets in production
+      POSTGRES_DB: appdb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    
+    # Temporary filesystems for runtime data
+    volumes:
+      - type: tmpfs
+        target: /run
+        read_only: false
+      - type: tmpfs
+        target: /var/run/postgresql
+        read_only: false
+      # Named volume for persistent data (encrypted at rest)
+      - db_data:/var/lib/postgresql/data
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    user: "70:70"  # postgres UID in postgres image
+    
+    labels:
+      com.example.service: "database"
+
+  # ========================================================================
+  # REVERSE PROXY / INGRESS (Optional: Caddy)
+  # ========================================================================
+  # Useful for:
+  # - TLS termination (HTTPS)
+  # - Request filtering
+  # - Access control
+  # - Rate limiting
+  caddy:
+    image: caddy:2.7-alpine
+    
+    restart: unless-stopped
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Required to bind to port 80/443
+    
+    read_only: true
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    expose:
+      - 2019  # Caddy admin API
+    
+    volumes:
+      # Caddyfile configuration (read-only)
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Temporary storage (Caddy writes certificates here)
+      - type: tmpfs
+        target: /data
+        read_only: false
+      - type: tmpfs
+        target: /config
+        read_only: false
+    
+    environment:
+      ACME_AGREE: "true"  # Agree to Let's Encrypt terms
+    
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    
+    user: "1000:1000"
+    
+    depends_on:
+      - app
+    
+    labels:
+      com.example.service: "ingress"
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+volumes:
+  db_data:
+    # Encrypted at rest (if using Docker Desktop with built-in encryption)
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgres  # Host path for persistence
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+networks:
+  default:
+    name: myapp_network
+    driver: bridge
+    driver_opts:
+      # Disable IPv6 if not needed
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.enable_icc: "true"  # Inter-container communication
+
+  # Optional: separate network for sensitive services
+  # internal:
+  #   driver: bridge
+  #   internal: true  # Isolate from external networks
+
+# ============================================================================
+# ORCHESTRATION HINTS (Docker Swarm / Kubernetes)
+# ============================================================================
+# To deploy to production:
+#
+# 1. Use Docker secrets for sensitive data:
+#    docker secret create db_password <(echo 'secure_password')
+#
+#    Then reference: secrets:
+#                      db_password
+#
+#    In app container:
+#      cat /run/secrets/db_password
+#
+# 2. Use Docker configs for configuration files:
+#    docker config create app_config ./config.json
+#
+# 3. Set placement constraints:
+#    deploy:
+#      placement:
+#        constraints:
+#          - node.role == worker
+#          - node.labels.zone == us-east
+#
+# 4. Set resource reservations:
+#    deploy:
+#      resources:
+#        limits:
+#          cpus: '0.5'
+#          memory: 512M
+#        reservations:
+#          cpus: '0.25'
+#          memory: 256M
+#
+# 5. Set update/rollback policy:
+#    deploy:
+#      update_config:
+#        parallelism: 1
+#        delay: 10s
+#      rollback_config:
+#        parallelism: 1
+#        delay: 10s
+
+# ============================================================================
+# EXAMPLE: DOCKER COMPOSE WITH SECRETS (for Swarm mode)
+# ============================================================================
+# version: '3.8'
+# services:
+#   app:
+#     ...
+#     secrets:
+#       - db_password
+#     environment:
+#       DATABASE_PASSWORD_FILE: /run/secrets/db_password
+#
+# secrets:
+#   db_password:
+#     external: true  # Created separately: docker secret create ...
+#     # OR
+#     # file: ./secrets/db_password.txt
